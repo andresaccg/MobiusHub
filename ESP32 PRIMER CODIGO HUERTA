@@ -1,0 +1,375 @@
+#include <BluetoothSerial.h>
+#include <Preferences.h>
+
+BluetoothSerial SerialBT;
+Preferences prefs;
+
+const int RELAY_PIN = 26;
+const int DEFAULT_HOUR = 6;
+const int DEFAULT_MINUTE = 0;
+const unsigned long DEFAULT_DURATION = 60;
+
+// ----- Validaciones -----
+const unsigned long MIN_DURATION = 1;
+const unsigned long MAX_DURATION = 36000;
+
+// ----- Preferencias keys -----
+const char* PREF_NAMESPACE = "riego";
+const char* KEY_HOUR = "hour";
+const char* KEY_MIN = "min";
+const char* KEY_DUR = "dur";
+const char* KEY_LOG_COUNT = "logcount";
+
+struct CycleLog {
+  unsigned long timestamp_seconds;
+  unsigned long duration_seconds;
+};
+
+const int MAX_LOG_ENTRIES = 50;
+
+int scheduleHour;
+int scheduleMinute;
+unsigned long durationSeconds;
+
+unsigned long bootMillisSec = 0;
+
+unsigned long hhmmToSeconds(int h, int m) {
+  return (unsigned long)h * 3600UL + (unsigned long)m * 60UL;
+}
+
+unsigned long currentSecondsSinceBoot() {
+  return (unsigned long)(millis() / 1000UL);
+}
+
+void loadConfiguration() {
+  prefs.begin(PREF_NAMESPACE, true);
+  bool hasHour = prefs.isKey(KEY_HOUR);
+  prefs.end();
+
+  prefs.begin(PREF_NAMESPACE, false);
+
+  if (hasHour) {
+    scheduleHour = prefs.getInt(KEY_HOUR, DEFAULT_HOUR);
+    scheduleMinute = prefs.getInt(KEY_MIN, DEFAULT_MINUTE);
+    durationSeconds = prefs.getULong(KEY_DUR, DEFAULT_DURATION);
+  } else {
+
+    scheduleHour = DEFAULT_HOUR;
+    scheduleMinute = DEFAULT_MINUTE;
+    durationSeconds = DEFAULT_DURATION;
+
+    prefs.putInt(KEY_HOUR, scheduleHour);
+    prefs.putInt(KEY_MIN, scheduleMinute);
+    prefs.putULong(KEY_DUR, durationSeconds);
+    prefs.putInt(KEY_LOG_COUNT, 0);
+  }
+
+  prefs.end();
+  // Validaciones básicas
+  if (scheduleHour < 0 || scheduleHour > 23) scheduleHour = DEFAULT_HOUR;
+  if (scheduleMinute < 0 || scheduleMinute > 59) scheduleMinute = DEFAULT_MINUTE;
+  if (durationSeconds < MIN_DURATION || durationSeconds > MAX_DURATION) durationSeconds = DEFAULT_DURATION;
+}
+
+// Guardar configuración modificada por app
+void saveConfiguration() {
+  prefs.begin(PREF_NAMESPACE, false);
+  prefs.putInt(KEY_HOUR, scheduleHour);
+  prefs.putInt(KEY_MIN, scheduleMinute);
+  prefs.putULong(KEY_DUR, durationSeconds);
+  prefs.end();
+}
+
+// Log management
+int getLogCount() {
+  prefs.begin(PREF_NAMESPACE, true);
+  int count = prefs.getInt(KEY_LOG_COUNT, 0);
+  prefs.end();
+  return count;
+}
+
+void setLogCount(int c) {
+  prefs.begin(PREF_NAMESPACE, false);
+  prefs.putInt(KEY_LOG_COUNT, c);
+  prefs.end();
+}
+
+void appendLog(unsigned long ts, unsigned long dur) {
+  prefs.begin(PREF_NAMESPACE, false);
+  int count = prefs.getInt(KEY_LOG_COUNT, 0);
+  int idx = count % MAX_LOG_ENTRIES;
+  String keyT = "log" + String(idx) + "_t";
+  String keyD = "log" + String(idx) + "_d";
+  prefs.putULong(keyT.c_str(), ts);
+  prefs.putULong(keyD.c_str(), dur);
+  prefs.putInt(KEY_LOG_COUNT, count + 1);
+  prefs.end();
+}
+
+// Read a log entry by index (0 oldest..n-1 newest)
+bool readLog(int globalIndex, CycleLog &out) {
+  int count = getLogCount();
+  if (globalIndex < 0 || globalIndex >= count) return false;
+  int start = (count <= MAX_LOG_ENTRIES) ? 0 : (count % MAX_LOG_ENTRIES);
+  int idx = (start + globalIndex) % MAX_LOG_ENTRIES;
+  prefs.begin(PREF_NAMESPACE, true);
+  String keyT = "log" + String(idx) + "_t";
+  String keyD = "log" + String(idx) + "_d";
+  if (!prefs.isKey(keyT.c_str())) { prefs.end(); return false; }
+  out.timestamp_seconds = prefs.getULong(keyT.c_str(), 0);
+  out.duration_seconds = prefs.getULong(keyD.c_str(), 0);
+  prefs.end();
+  return true;
+}
+
+void clearLogs() {
+  prefs.begin(PREF_NAMESPACE, false);
+  int count = prefs.getInt(KEY_LOG_COUNT, 0);
+  int entries = min(count, MAX_LOG_ENTRIES);
+  for (int i = 0; i < entries; ++i) {
+    String keyT = "log" + String(i) + "_t";
+    String keyD = "log" + String(i) + "_d";
+    if (prefs.isKey(keyT.c_str())) prefs.remove(keyT.c_str());
+    if (prefs.isKey(keyD.c_str())) prefs.remove(keyD.c_str());
+  }
+  prefs.putInt(KEY_LOG_COUNT, 0);
+  prefs.end();
+}
+
+// -Bluetooth-
+void handleSetSchedule(String payload) {
+  payload.trim();
+  int colon = payload.indexOf(':');
+  if (colon == -1) {
+    SerialBT.println("ERR Invalid schedule format. Use hh:mm");
+    return;
+  }
+  String sh = payload.substring(0, colon);
+  String sm = payload.substring(colon + 1);
+  int h = sh.toInt();
+  int m = sm.toInt();
+  if (h < 0 || h > 23 || m < 0 || m > 59) {
+    SerialBT.println("ERR Schedule out of range");
+    return;
+  }
+  scheduleHour = h;
+  scheduleMinute = m;
+  saveConfiguration();
+  SerialBT.printf("OK Schedule set %02d:%02d\n", scheduleHour, scheduleMinute);
+}
+
+void handleSetDuration(String payload) {
+  payload.trim();
+  unsigned long d = (unsigned long)payload.toInt();
+  if (d < MIN_DURATION || d > MAX_DURATION) {
+    SerialBT.printf("ERR Duration out of range (%lu..%lu)\n", MIN_DURATION, MAX_DURATION);
+    return;
+  }
+  durationSeconds = d;
+  saveConfiguration();
+  SerialBT.printf("OK Duration set %lu seconds\n", durationSeconds);
+}
+
+void handleGetConfig() {
+  SerialBT.printf("CONFIG %02d:%02d %lu\n", scheduleHour, scheduleMinute, durationSeconds);
+}
+
+void handleGetLogs() {
+  int count = getLogCount();
+  SerialBT.printf("LOGCOUNT %d\n", count);
+  int toSend = min(count, MAX_LOG_ENTRIES);
+  for (int i = 0; i < toSend; ++i) {
+    CycleLog entry;
+    if (readLog(i, entry)) {
+      SerialBT.printf("LOG %d %lu %lu\n", i, entry.timestamp_seconds, entry.duration_seconds);
+    }
+  }
+}
+
+void processBluetoothLine(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+  // Tokenize by space
+  int sp = line.indexOf(' ');
+  String cmd = (sp == -1) ? line : line.substring(0, sp);
+  cmd.toUpperCase();
+  if (cmd == "SET") {
+    String rest = line.substring(sp + 1);
+    int sp2 = rest.indexOf(' ');
+    if (sp2 == -1) {
+      SerialBT.println("ERR Invalid SET command");
+      return;
+    }
+    String sub = rest.substring(0, sp2);
+    String payload = rest.substring(sp2 + 1);
+    sub.toUpperCase();
+    if (sub == "SCHEDULE") {
+      handleSetSchedule(payload);
+    } else if (sub == "DURATION") {
+      handleSetDuration(payload);
+    } else {
+      SerialBT.println("ERR Unknown SET target");
+    }
+  } else if (cmd == "GET") {
+    String rest = (sp == -1) ? "" : line.substring(sp + 1);
+    rest.toUpperCase();
+    if (rest == "CONFIG") handleGetConfig();
+    else if (rest == "LOGS") handleGetLogs();
+    else SerialBT.println("ERR Unknown GET target");
+  } else if (cmd == "CLEAR") {
+    String rest = (sp == -1) ? "" : line.substring(sp + 1);
+    rest.toUpperCase();
+    if (rest == "LOGS") { clearLogs(); SerialBT.println("OK Logs cleared"); }
+    else SerialBT.println("ERR Unknown CLEAR target");
+  } else {
+    SerialBT.println("ERR Unknown command");
+  }
+}
+
+String btBuffer = "";
+
+ 
+void pollBluetoothInput() {
+  while (SerialBT.available()) {
+    char c = SerialBT.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      processBluetoothLine(btBuffer);
+      btBuffer = "";
+    } else {
+      btBuffer += c;
+      if (btBuffer.length() > 256) btBuffer = btBuffer.substring(0, 256);
+    }
+  }
+}
+
+// Check if Bluetooth client connected (SPP)
+bool isBluetoothConnected() {
+  // BluetoothSerial provides hasClient() to know if paired app is connected
+  return SerialBT.hasClient();
+}
+
+// ---------- Relay control ----------
+void relayOn() {
+  digitalWrite(RELAY_PIN, LOW); // Depende del módulo: muchos relés son active LOW
+  // Si tu módulo es active HIGH, cambia a digitalWrite(RELAY_PIN, HIGH);
+}
+
+void relayOff() {
+  digitalWrite(RELAY_PIN, HIGH); // ver comentario anterior
+}
+
+// Safety: ensure relay off
+void safeShutdownRelay() {
+  relayOff();
+}
+
+// ---------- Flow functions ----------
+void iniciarConexionBluetooth() {
+  // Iniciar SPP Classic Bluetooth (no BLE) (según lista: HC-05 o integrado)
+  SerialBT.begin("ESP32_Riego"); // nombre del dispositivo
+  delay(200);
+}
+
+// Esperar hora de riego: compara "hora del día" relativa (seg desde arranque modulo 86400)
+void esperarHoraDeRiego() {
+  unsigned long target = hhmmToSeconds(scheduleHour, scheduleMinute);
+  while (true) {
+    // Mantener lectura de Bluetooth para permitir recepción de cambios
+    pollBluetoothInput();
+    // Si se recibe configuración nueva, aplicar y recalcular target
+    // (processBluetoothLine guarda inmediatamente)
+    unsigned long now = currentSecondsSinceBoot() % 86400UL;
+    if (now == target) {
+      // Debemos evitar detección continua durante el mismo segundo: esperar a que cambie de segundo
+      // proceder
+      break;
+    }
+    // También permitir una ventana si el dispositivo se inició después de la hora objetivo:
+    // si la ventana de espera supera 23h59min se seguirá intentando cada día (comportamiento del diagrama)
+    delay(250); // pequeño sleep para no bloquear excesivo
+  }
+}
+
+// Activar riego por duración y registrar
+void ejecutarCicloRiego() {
+  // Activar relé -> encender bomba 12V
+  relayOn();
+
+  unsigned long startTs = currentSecondsSinceBoot();
+  unsigned long remaining = durationSeconds;
+  unsigned long lastTick = millis();
+
+  while (remaining > 0) {
+    pollBluetoothInput(); // aceptar comandos incluso durante riego (posible parada por app futuro)
+    unsigned long now = millis();
+    unsigned long elapsedMs = now - lastTick;
+    if (elapsedMs >= 1000) {
+      unsigned long elapsedSec = elapsedMs / 1000;
+      if (elapsedSec > remaining) elapsedSec = remaining;
+      remaining -= elapsedSec;
+      lastTick += elapsedSec * 1000;
+    }
+    // seguridad: si app pide duration 0 (vía comando malformado) cortar
+    if (durationSeconds == 0) break;
+    delay(10);
+  }
+
+  // Apagar bomba
+  relayOff();
+
+  unsigned long endTs = currentSecondsSinceBoot();
+  unsigned long realDuration = (endTs >= startTs) ? (endTs - startTs) : durationSeconds;
+
+  // Registrar ciclo completado (hora y duración) -> append log
+  appendLog(startTs, realDuration);
+}
+
+// ---------- Setup & loop ----------
+void setup() {
+  // Inicializacion serial para debug
+  Serial.begin(115200);
+  delay(100);
+
+  // Pines
+  pinMode(RELAY_PIN, OUTPUT);
+  // Asumimos módulo relé active LOW (predeterminado). Dejar relé apagado.
+  relayOff();
+
+  // Inicio boot time
+  bootMillisSec = millis() / 1000UL;
+
+  // Cargar configuración (o defaults)
+  loadConfiguration();
+
+  // Iniciar Bluetooth (según diagrama: iniciar conexión Bluetooth)
+  iniciarConexionBluetooth();
+
+  // Mensaje de diagnóstico (puede retirarse en producción)
+  Serial.printf("Sistema iniciado. Schedule %02d:%02d dur %lu\n", scheduleHour, scheduleMinute, durationSeconds);
+}
+//AGREGAR MENSAJE SERIAL DE LAS ACCIONES DE LA APLICACION, ENCENDER EL LED AZUL DEL ESP PARA CUANDO SE EMPAREJA AL CELULAR 
+
+void loop() {
+  // Verificar si hay conexión activa
+  bool btConnected = isBluetoothConnected();
+
+  if (btConnected) {
+    // Recibir datos de la app (diagrama: "Recibir datos de la app")
+    // Poll y esperar posibles comandos. No bloquear demasiado.
+    unsigned long start = millis();
+    // Leer y procesar datos entrantes durante una ventana corta inicial
+    while (millis() - start < 500) {
+      pollBluetoothInput();
+      delay(10);
+    }
+  } else {
+  }
+
+  esperarHoraDeRiego();
+
+  ejecutarCicloRiego();
+
+  delay(1000);
+
+}
